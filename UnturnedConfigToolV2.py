@@ -23,7 +23,7 @@ import urllib.request
 import webview
 
 APP_NAME = "Unturned 服务器配置工具"
-APP_VERSION = "2.3.9"
+APP_VERSION = "2.4"
 
 # ---------------------------------------------------------------------------
 # 基础 JSON / 文本读写（容忍 // 注释）
@@ -1404,6 +1404,107 @@ class Api:
     def get_meta(self):
         return {"maps": MAPS, "difficulties": list(DIFFICULTIES),
                 "difficulty_groups": list(DIFFICULTY_GROUPS)}
+
+    # ---------- 一键分享给朋友 ----------
+    def share_info(self, instance, lang="zh"):
+        """生成服务器分享信息与可复制文案（公网 / 局域网两种）。"""
+        instance = (instance or "").strip()
+        bad = self._check_instance_name(instance)
+        if bad:
+            return bad
+        r = self.load_instance(instance)
+        if not r.get("ok"):
+            return r
+        commands = r.get("commands") or []
+
+        def cv(key):
+            for ln in commands:
+                parts = ln.strip().split(None, 1)
+                if parts and parts[0].lower() == key.lower():
+                    return parts[1].strip() if len(parts) > 1 else ""
+            return ""
+
+        srv_name = cv("Name") or instance
+        port = self._instance_port(instance)
+        map_name = cv("Map") or "—"
+        mode = cv("Mode") or "Normal"
+        maxp = cv("Maxplayers") or "16"
+        pub = self.detect_public_ip()
+        lan = self.local_ip()
+        pub_ip = pub.get("ip") if pub.get("ok") else None
+        pub_err = pub.get("error") if not pub.get("ok") else None
+
+        if lang == "en":
+            tpl_pub = ("[Unturned Server] {name}\nIP: {ip}:{port}\n"
+                       "Map: {map} | Difficulty: {mode} | Max players: {max}\nJoin us!")
+            tpl_lan = ("[Unturned Server] {name}\nIP: {ip}:{port} (same WiFi / LAN)\n"
+                       "Map: {map} | Difficulty: {mode} | Max players: {max}\nJoin us!")
+        else:
+            tpl_pub = ("【Unturned 服务器】{name}\nIP：{ip}:{port}\n"
+                       "地图：{map} ｜ 难度：{mode} ｜ 人数上限：{max}\n快来一起玩！")
+            tpl_lan = ("【Unturned 服务器】{name}\nIP：{ip}:{port}（同一 WiFi / 局域网）\n"
+                       "地图：{map} ｜ 难度：{mode} ｜ 人数上限：{max}\n快来一起玩！")
+
+        def build(ip):
+            return tpl_pub.format(name=srv_name, ip=ip, port=port,
+                                  map=map_name, mode=mode, max=maxp)
+
+        return {
+            "ok": True,
+            "server_name": srv_name, "port": port, "map": map_name,
+            "mode": mode, "max_players": maxp,
+            "public_ip": pub_ip, "public_error": pub_err,
+            "lan_ip": lan,
+            "text_public": build(pub_ip) if pub_ip else None,
+            "text_lan": tpl_lan.format(name=srv_name, ip=lan, port=port,
+                                       map=map_name, mode=mode, max=maxp),
+        }
+
+    def copy_text(self, text):
+        """把文本写入系统剪贴板（Unicode）。"""
+        import ctypes
+        CF_UNICODETEXT = 13
+        GMEM_MOVEABLE = 0x0002
+        GMEM_ZEROINIT = 0x0040
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        # 关键：所有返回句柄/指针的 API 必须声明 restype，否则 64 位进程里
+        # 返回值被截断成 32 位，GlobalLock 后 memmove 写入空地址直接崩溃。
+        user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+        user32.OpenClipboard.restype = ctypes.c_int
+        user32.EmptyClipboard.restype = ctypes.c_int
+        user32.CloseClipboard.restype = ctypes.c_int
+        user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+        user32.SetClipboardData.restype = ctypes.c_void_p
+        kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+        kernel32.GlobalAlloc.restype = ctypes.c_void_p
+        kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalLock.restype = ctypes.c_void_p
+        kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalUnlock.restype = ctypes.c_int
+        try:
+            if not user32.OpenClipboard(None):
+                return {"ok": False, "error": "无法打开剪贴板"}
+            try:
+                user32.EmptyClipboard()
+                data = (text + "\x00").encode("utf-16-le")
+                h = kernel32.GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, len(data))
+                if not h:
+                    return {"ok": False, "error": "内存分配失败"}
+                p = kernel32.GlobalLock(h)
+                if not p:
+                    return {"ok": False, "error": "锁定内存失败"}
+                try:
+                    ctypes.memmove(p, data, len(data))
+                finally:
+                    kernel32.GlobalUnlock(h)
+                if not user32.SetClipboardData(CF_UNICODETEXT, h):
+                    return {"ok": False, "error": "写入剪贴板失败"}
+                return {"ok": True}
+            finally:
+                user32.CloseClipboard()
+        except Exception as e:
+            return {"ok": False, "error": f"复制失败: {e}"}
 
     # ---------- 服务器控制（一键启动 / 控制台） ----------
     def _server_log_path(self, instance):
