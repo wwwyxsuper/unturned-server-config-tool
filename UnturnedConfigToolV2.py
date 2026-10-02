@@ -14,14 +14,16 @@ import json
 import os
 import shutil
 import socket
+import subprocess
 import sys
 import threading
+import time
 import urllib.request
 
 import webview
 
 APP_NAME = "Unturned 服务器配置工具"
-APP_VERSION = "2.3.4"
+APP_VERSION = "2.3.9"
 
 # ---------------------------------------------------------------------------
 # 基础 JSON / 文本读写（容忍 // 注释）
@@ -763,6 +765,13 @@ class Api:
         self.load_settings()
         self._ws_names_cache = {}
         self._ws_names_loading = set()
+        # 服务器控制（一键启动 / 控制台）
+        self._server_proc = None       # subprocess.Popen
+        self._server_instance = None   # 当前启动的实例名
+        self._server_mode = None       # lan / internet
+        self._server_port = None
+        self._log_offset = 0           # 日志文件增量读取偏移
+        self._server_lock = threading.Lock()
 
     # ---------- settings ----------
     def load_settings(self):
@@ -811,12 +820,12 @@ class Api:
     def list_instances(self):
         sd = self.servers_dir()
         if not os.path.isdir(sd):
-            return {"instances": [], "game_dir": self.game_dir}
+            return {"instances": [], "game_dir": self.game_dir, "dir_valid": False}
         names = sorted(
             n for n in os.listdir(sd)
             if os.path.isdir(os.path.join(sd, n))
         )
-        return {"instances": names, "game_dir": self.game_dir}
+        return {"instances": names, "game_dir": self.game_dir, "dir_valid": True}
 
     def instance_path(self, name):
         return os.path.join(self.servers_dir(), name)
@@ -862,6 +871,13 @@ class Api:
             config = load_json_file(cfg_path) if os.path.isfile(cfg_path) else None
         except Exception as e:
             return {"ok": False, "error": f"Config.json 解析失败（文件可能损坏）: {e}"}
+        # Config.json 缺失（如从未启动过服务器）：生成空骨架供直接编辑，
+        # 保存时自动创建文件；同时标记 config_missing 让前端显示引导提示。
+        config_missing = config is None
+        if config is None:
+            config = {k: {} for k in ("Browser", "Server", "UnityEvents")}
+            for d in DIFFICULTIES:
+                config[d] = {g: {} for g in DIFFICULTY_GROUPS}
         try:
             commands = load_commands(cmd_path)
         except Exception as e:
@@ -893,7 +909,8 @@ class Api:
             "commands": commands,
             "workshop": workshop,
             "stats": {"config_params": total, "command_lines": len(commands),
-                      "players": player_count, "has_gsl": bool(self._cmd_value(commands, "GSLT"))},
+                      "players": player_count, "has_gsl": bool(self._cmd_value(commands, "GSLT")),
+                      "config_missing": config_missing},
             "translations": {"groups": GROUP_NAMES, "params": PARAM_NAMES,
                              "descs": {"flat": PARAM_DESCS, "group": PARAM_DESCS_OVERRIDES},
                              "commands": COMMAND_HINTS},
@@ -1329,9 +1346,230 @@ class Api:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    def open_url(self, url):
+        try:
+            os.startfile(url)  # noqa
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def pick_folder(self, initial=""):
+        """弹出系统「选择文件夹」对话框，返回所选目录；用户取消返回 cancelled。
+        用 ctypes 调 Windows 原生 SHBrowseForFolder，无额外依赖。
+        注意：BROWSEINFO 全部使用 ctypes 基础类型——wintypes 里没有
+        LPCITEMIDLIST，用了会在任意环境抛 AttributeError（v2.3.7 实测踩过）。"""
+        import ctypes
+        try:
+            BIF_RETURNONLYFSDIRS = 0x00000001
+            BIF_NEWDIALOGSTYLE = 0x00000040
+
+            class BROWSEINFO(ctypes.Structure):
+                _fields_ = [
+                    ("hwndOwner", ctypes.c_void_p),
+                    ("pidlRoot", ctypes.c_void_p),
+                    ("pszDisplayName", ctypes.c_wchar_p),
+                    ("lpszTitle", ctypes.c_wchar_p),
+                    ("ulFlags", ctypes.c_uint),
+                    ("lpfn", ctypes.c_void_p),
+                    ("lParam", ctypes.c_ssize_t),
+                    ("iImage", ctypes.c_int),
+                ]
+
+            shell32 = ctypes.windll.shell32
+            # 关键：必须声明指针型返回值的 restype。ctypes 默认把返回值当
+            # 32 位 c_int，64 位进程里 SHBrowseForFolderW 返回的 PIDL 指针
+            # 会被截断成残缺地址，SHGetPathFromIDListW 一读就 access violation
+            # （v2.3.8 实测：pidl 截断后变成 0x00000000F01DD050 类地址）。
+            shell32.SHBrowseForFolderW.argtypes = [ctypes.c_void_p]
+            shell32.SHBrowseForFolderW.restype = ctypes.c_void_p
+            shell32.SHGetPathFromIDListW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+            shell32.SHGetPathFromIDListW.restype = ctypes.c_int
+
+            buf = ctypes.create_unicode_buffer(260)
+            bi = BROWSEINFO()
+            bi.hwndOwner = None
+            bi.pszDisplayName = ctypes.cast(buf, ctypes.c_wchar_p)
+            bi.lpszTitle = "选择 Unturned 游戏根目录（必须包含 Servers 文件夹）"
+            bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE
+            pidl = shell32.SHBrowseForFolderW(ctypes.byref(bi))
+            if not pidl:
+                return {"ok": False, "cancelled": True}
+            path = ctypes.create_unicode_buffer(260)
+            if shell32.SHGetPathFromIDListW(pidl, path):
+                return {"ok": True, "path": path.value}
+            return {"ok": False, "cancelled": True}
+        except Exception as e:
+            return {"ok": False, "error": f"选择文件夹失败: {e}"}
+
     def get_meta(self):
         return {"maps": MAPS, "difficulties": list(DIFFICULTIES),
                 "difficulty_groups": list(DIFFICULTY_GROUPS)}
+
+    # ---------- 服务器控制（一键启动 / 控制台） ----------
+    def _server_log_path(self, instance):
+        return os.path.join(self.game_dir, "Logs", f"Server_{instance}.log")
+
+    def _instance_port(self, instance):
+        """从实例 Commands.dat 读 Port，读不到回默认 27015。"""
+        try:
+            r = self.load_instance(instance)
+            if r.get("ok") and r.get("commands"):
+                for line in r["commands"]:
+                    parts = line.split(None, 1)
+                    if parts and parts[0].lower() == "port" and len(parts) > 1:
+                        return int(parts[1])
+        except Exception:
+            pass
+        return 27015
+
+    def server_start(self, instance, server_type="internet", port=None):
+        """一键启动 Unturned 专用服务器。
+        instance=实例名；server_type=lan / internet；port 缺省时读实例 Commands.dat 的 Port。
+        启动方式与 ServerHelper.bat 一致：Unturned.exe -batchmode -nographics -Port <port> +前缀/实例名。"""
+        instance = (instance or "").strip()
+        bad = self._check_instance_name(instance)
+        if bad:
+            return bad
+        inst_dir = self.instance_path(instance)
+        if not os.path.isdir(inst_dir):
+            return {"ok": False, "error": f"实例 {instance} 不存在"}
+        exe = os.path.join(self.game_dir, "Unturned.exe")
+        if not os.path.isfile(exe):
+            return {"ok": False, "error": f"未找到 {exe}，请先在设置中确认游戏目录"}
+        if port is None:
+            port = self._instance_port(instance)
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": f"端口无效: {port}"}
+        if not (1 <= port <= 65535):
+            return {"ok": False, "error": f"端口超出范围: {port}"}
+        with self._server_lock:
+            if self._server_proc is not None and self._server_proc.poll() is None:
+                return {"ok": False, "error": f"服务器已在运行（实例 {self._server_instance}）"}
+            prefix = "+InternetServer" if server_type == "internet" else "+LanServer"
+            args = [exe, "-batchmode", "-nographics",
+                    "-Port", str(port), f"{prefix}/{instance}"]
+            try:
+                proc = subprocess.Popen(
+                    args, cwd=self.game_dir,
+                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            except Exception as e:
+                return {"ok": False, "error": f"启动失败: {e}"}
+            self._server_proc = proc
+            self._server_instance = instance
+            self._server_mode = server_type
+            self._server_port = port
+            # 从当前日志文件大小处开始增量读（避免读到上一轮残留）
+            try:
+                self._log_offset = os.path.getsize(self._server_log_path(instance))
+            except Exception:
+                self._log_offset = 0
+        return {"ok": True, "pid": proc.pid, "instance": instance,
+                "server_type": server_type, "port": port,
+                "args": args}
+
+    def server_stop(self):
+        """停止服务器：优先向控制台发 shutdown 优雅关服，25 秒内未退出则强杀。"""
+        with self._server_lock:
+            proc = self._server_proc
+            if proc is None:
+                return {"ok": False, "error": "服务器未在运行"}
+            if proc.poll() is not None:
+                self._server_proc = None
+                self._server_instance = None
+                return {"ok": False, "error": f"服务器进程已自行退出（代码 {proc.poll()}）"}
+            try:
+                if proc.stdin:
+                    proc.stdin.write("shutdown\n")
+                    proc.stdin.flush()
+            except Exception:
+                pass
+            # 优雅关服最多等 25 秒
+            deadline = time.time() + 25
+            while time.time() < deadline and proc.poll() is None:
+                time.sleep(0.5)
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                proc.wait(timeout=10)
+            code = proc.poll()
+            self._server_proc = None
+            self._server_instance = None
+            self._server_mode = None
+            self._server_port = None
+            return {"ok": True, "exit_code": code, "graceful": code == 0}
+
+    def server_status(self):
+        """查询服务器运行状态。running / stopped / exited。"""
+        with self._server_lock:
+            proc = self._server_proc
+            if proc is None:
+                return {"running": False, "state": "stopped", "instance": None}
+            if proc.poll() is None:
+                return {"running": True, "state": "running",
+                        "instance": self._server_instance,
+                        "mode": self._server_mode, "port": self._server_port,
+                        "pid": proc.pid}
+            code = proc.poll()
+            self._server_proc = None
+            self._server_instance = None
+            self._server_mode = None
+            self._server_port = None
+            return {"running": False, "state": "exited", "exit_code": code,
+                    "instance": None}
+
+    def server_log(self):
+        """增量读取服务器日志（Logs/Server_<实例名>.log），返回新增行。"""
+        with self._server_lock:
+            proc = self._server_proc
+            running = proc is not None and proc.poll() is None
+            instance = self._server_instance
+        if not instance:
+            return {"running": running, "lines": [], "file": None}
+        path = self._server_log_path(instance)
+        try:
+            size = os.path.getsize(path)
+        except Exception:
+            return {"running": running, "lines": [], "file": path}
+        if size < self._log_offset:
+            self._log_offset = 0          # 服务器重启/旋转了日志，从头读
+        if size <= self._log_offset:
+            return {"running": running, "lines": [], "file": path}
+        try:
+            with open(path, "rb") as f:
+                f.seek(self._log_offset)
+                data = f.read(size - self._log_offset)
+            self._log_offset = size
+        except Exception:
+            return {"running": running, "lines": [], "file": path}
+        text = data.decode("utf-8", errors="replace")
+        lines = [ln.rstrip("\r") for ln in text.split("\n")]
+        if lines and lines[-1] == "":
+            lines.pop()
+        return {"running": running, "lines": lines, "file": path}
+
+    def server_command(self, command):
+        """向运行中的服务器控制台发送命令（shutdown / kick / ban 等）。"""
+        command = (command or "").strip().replace("\n", " ").replace("\r", " ")
+        if not command:
+            return {"ok": False, "error": "命令为空"}
+        with self._server_lock:
+            proc = self._server_proc
+            if proc is None or proc.poll() is not None:
+                return {"ok": False, "error": "服务器未在运行"}
+            try:
+                if proc.stdin is None:
+                    return {"ok": False, "error": "服务器控制台不可用（stdin 未接通）"}
+                proc.stdin.write(command + "\n")
+                proc.stdin.flush()
+                return {"ok": True, "command": command}
+            except Exception as e:
+                return {"ok": False, "error": f"发送失败: {e}"}
 
 
 # ---------------------------------------------------------------------------
